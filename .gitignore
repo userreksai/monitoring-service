@@ -1,0 +1,7 @@
+/monitoring-service
+/monitoring-service.exe
+/*.db
+/*.db-shm
+/*.db-wal
+/.env
+/coverage.out
