@@ -1,5 +1,7 @@
 /monitoring-service
 /monitoring-service.exe
+/bin/
+/.gocache/
 /*.db
 /*.db-shm
 /*.db-wal
