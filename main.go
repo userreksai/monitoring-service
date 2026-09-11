@@ -122,7 +122,7 @@ func main() {
 		}
 		log.Println("JWT_SECRET 未配置，本次启动使用临时密钥；重启后已有登录令牌会失效")
 	}
-	handler := newHandler(&server{db: db, secret: secret}, parseOrigins(env("CORS_ORIGINS", "http://localhost:8900")))
+	handler := newHandler(&server{db: db, secret: secret}, parseOrigins(env("CORS_ORIGINS", "http://localhost:8900,http://127.0.0.1:8900")))
 	addr := "0.0.0.0:" + port
 	log.Printf("短信计费监控 API 已启动: http://localhost:%s（管理员: %s）", port, adminUser)
 	httpServer := &http.Server{

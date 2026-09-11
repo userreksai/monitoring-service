@@ -28,7 +28,7 @@ go run .
 | `ADMIN_USERNAME` | `admin` | 首次初始化的管理员账号 |
 | `ADMIN_PASSWORD` | `Admin@123456` | 首次初始化的管理员密码 |
 | `JWT_SECRET` | 临时随机值 | JWT 签名密钥；生产环境必须固定且至少 32 字节 |
-| `CORS_ORIGINS` | `http://localhost:8900` | 允许的前端 Origin，多个地址使用英文逗号分隔；可用 `*` 放行全部来源 |
+| `CORS_ORIGINS` | `http://localhost:8900,http://127.0.0.1:8900` | 允许的前端 Origin，多个地址使用英文逗号分隔；可用 `*` 放行全部来源 |
 
 管理员只会在用户名不存在时创建；修改环境变量不会覆盖数据库中已有账号。
 
