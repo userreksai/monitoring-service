@@ -1,79 +1,55 @@
-# monitoring-service
+# monitoring-service（MySQL 版）
 
-短信计费监控系统的 Go + SQLite 后端。服务仅提供 JSON API，默认监听 `8901`；Vue 前端默认运行在 `http://localhost:8900`。
+Go 1.22+、MySQL 8.0.16+，默认 API 端口 8901。前端接口保持兼容。
 
-## 本地运行
+数据库默认 `sms_billing_monitor`，沿用 `business`、`business_detail`、`notification_log`、`user_account`。本版本没有 SQLite 驱动和 SQLite 回退。防抖沿用 `alert_silence_seconds`，通过 API 显示为 `m/h/d`。示例配置见 `.env.example`。
 
-需要 Go 1.22 或更高版本：
+## 运行
 
 ```bash
 go mod download
-go test ./...
-go run .
+go build -o bin/monitoring-service .
+# 创建/升级表结构，不启动服务
+./bin/monitoring-service --env-file .env --migrate-only
+# 启动 API
+./bin/monitoring-service --env-file .env
 ```
 
-默认管理员仅用于本地首次运行：
+配置：`MYSQL_HOST`、`MYSQL_PORT`、`MYSQL_DATABASE`、`MYSQL_USER`、`MYSQL_PASSWORD`、`MYSQL_TIME_ZONE`、`MYSQL_TLS`；其他配置为 `PORT`、`JWT_SECRET`、`CORS_ORIGINS`、`ADMIN_USERNAME`、`ADMIN_PASSWORD`。已有环境变量优先于 `--env-file`。新管理员仅在该账号不存在时创建，已有密码不会被初始化参数覆盖；旧 SHA-256 密码登录成功后升级为 PBKDF2。
 
-- 用户名：`admin`
-- 密码：`Admin@123456`
+启动迁移只增加缺失字段和表，不插入示例业务，不覆盖已有账号/阈值。`schema.sql` 定义完整新库结构，`database.go` 补齐原表字段。MySQL 账号需要本库 SELECT、INSERT、UPDATE、DELETE、CREATE、ALTER、INDEX、REFERENCES 权限。
 
-生产环境务必通过环境变量覆盖密码和 JWT 密钥。
+## 生产升级
 
-## 配置
-
-| 环境变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `PORT` | `8901` | API 监听端口 |
-| `DB_PATH` | `monitoring.db` | SQLite 文件路径 |
-| `ADMIN_USERNAME` | `admin` | 首次初始化的管理员账号 |
-| `ADMIN_PASSWORD` | `Admin@123456` | 首次初始化的管理员密码 |
-| `JWT_SECRET` | 临时随机值 | JWT 签名密钥；生产环境必须固定且至少 32 字节 |
-| `CORS_ORIGINS` | `http://localhost:8900,http://127.0.0.1:8900` | 允许的前端 Origin，多个地址使用英文逗号分隔；可用 `*` 放行全部来源 |
-
-管理员只会在用户名不存在时创建；修改环境变量不会覆盖数据库中已有账号。
+迁移说明位于 [monitoring-web 仓库的 MYSQL_UPGRADE.md](https://github.com/userreksai/monitoring-web/blob/main/MYSQL_UPGRADE.md)。在本仓库目录执行 `sudo bash deploy/install.sh /opt/monitoring-service`，安装器从当前源码构建，升级表结构并准备二进制，**不自动启动**，留出数据迁移步骤。安装器可独立使用，不依赖前端仓库目录。配置缺失时会创建模板并退出，填写后重试。
 
 ## API
 
-除健康检查和登录外，其余接口需发送 `Authorization: Bearer <token>`。
+除健康检查、登录外需 `Authorization: Bearer <token>`。
 
-| 方法 | 路径 | 用途 |
-| --- | --- | --- |
-| `GET` | `/api/health` | 健康检查 |
-| `POST` | `/api/auth/login` | 登录 |
-| `GET` | `/api/auth/me` | 当前用户 |
-| `GET` | `/api/stats` | 业务、规则和告警统计 |
-| `GET/POST` | `/api/businesses` | 告警业务列表/新增 |
-| `GET/PUT/PATCH/DELETE` | `/api/businesses/{id}` | 告警业务详情/修改/删除；`PATCH` 支持仅提交 `enabled` |
-| `GET/POST` | `/api/rules` | 告警设置列表/新增 |
-| `GET/PUT/PATCH/DELETE` | `/api/rules/{code}` | 告警设置详情/修改/删除；`PATCH` 支持部分字段 |
-| `GET/POST` | `/api/records` | 告警记录列表/新增 |
-| `GET/PATCH/DELETE` | `/api/records/{id}` | 告警记录详情/修改状态/删除 |
+| 方法 | 路径 | 功能 |
+|---|---|---|
+| GET | `/api/health` | 状态及 `database: mysql` |
+| POST | `/api/auth/login` | 登录 |
+| GET | `/api/auth/me` | 当前账号 |
+| GET | `/api/stats` | 统计 |
+| GET/POST | `/api/businesses` | 业务列表/新增 |
+| GET/PUT/PATCH/DELETE | `/api/businesses/{id}` | 单个业务 |
+| GET/POST | `/api/rules` | 规则列表/新增 |
+| GET/PUT/PATCH/DELETE | `/api/rules/{code}` | 单个规则 |
+| GET/POST | `/api/records` | 告警记录列表/新增 |
+| GET/PATCH/DELETE | `/api/records/{id}` | 单个记录 |
 
-告警规则的 `debounce` 必须是正数加单位 `m`、`h` 或 `d`，例如 `10m`、`2h`、`1d`。服务端会去除首尾空格、统一小写单位并规范数字格式。
+`POST /api/records` 增加可选 `eventId`（32 位小写十六进制），同一事件重试返回同一条记录。原始通知内容保存在 `alert_content`；新增 `alert_type`、`alert_value`、`status`、`level`、`event_id` 支持页面。原 MySQL 记录没有告警类型时，以原 `alert_content` 展示。
 
-## Ubuntu 24.04 LTS 部署
+保留原外键 RESTRICT，已有记录的规则、已有规则的业务不能直接删除，返回 409。重复保存未改变的配置仍返回成功。
 
-部署脚本会安装依赖、克隆或更新代码、运行测试、编译程序、初始化 systemd 服务并重启。首次运行还会创建独立系统用户、持久化数据库目录、随机管理员密码和 JWT 密钥。
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/userreksai/monitoring-service/main/deploy/install.sh -o /tmp/install-monitoring-service.sh
-sudo bash /tmp/install-monitoring-service.sh
-```
-
-指定前端域名和端口：
+## 测试
 
 ```bash
-sudo CORS_ORIGINS="https://monitor.example.com" PORT=8901 bash /tmp/install-monitoring-service.sh
+go test -v ./...
+# 设置后才能执行真实数据库测试，账号需 CREATE/DROP DATABASE 权限
+MYSQL_TEST_DSN='testuser:password@tcp(127.0.0.1:3306)/' go test -v ./...
 ```
 
-安装脚本在未指定 `CORS_ORIGINS` 时使用 `*`，确保通过服务器 IP 访问的前端也能联调。正式上线时建议像上例一样收紧到实际前端域名。
-
-首次部署后配置保存在 `/opt/monitoring-service/.env`。再次执行同一脚本会拉取 `main` 最新代码、重新测试与构建，然后重启 `monitoring-service`，并保留现有 `.env` 和 `/var/lib/monitoring-service/monitoring.db`。因此重复安装时传入的新端口或 CORS 参数不会覆盖现有配置；请使用 `sudoedit /opt/monitoring-service/.env` 修改后执行 `sudo systemctl restart monitoring-service`。
-
-常用命令：
-
-```bash
-sudo systemctl status monitoring-service
-sudo journalctl -u monitoring-service -f
-sudo systemctl restart monitoring-service
-```
+集成测试仅创建/删除随机 `monitoring_test_*` 数据库；没设置 `MYSQL_TEST_DSN` 时跳过。不要把测试管理员凭据写入仓库。

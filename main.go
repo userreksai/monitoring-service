@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -21,7 +22,7 @@ import (
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite"
+	"github.com/go-sql-driver/mysql"
 )
 
 type server struct {
@@ -48,7 +49,7 @@ type rule struct {
 	Provider    string  `json:"provider"`
 	Account     string  `json:"account"`
 	Threshold   float64 `json:"threshold"`
-	Fluctuation int     `json:"fluctuation"`
+	Fluctuation float64 `json:"fluctuation"`
 	Debounce    string  `json:"debounce"`
 	Purpose     string  `json:"purpose"`
 	Tag         string  `json:"tag"`
@@ -56,6 +57,7 @@ type rule struct {
 }
 
 type record struct {
+	EventID  string `json:"eventId,omitempty"`
 	ID       int64  `json:"id"`
 	Time     string `json:"time"`
 	Date     string `json:"date"`
@@ -89,7 +91,7 @@ type rulePatch struct {
 	Provider    *string  `json:"provider"`
 	Account     *string  `json:"account"`
 	Threshold   *float64 `json:"threshold"`
-	Fluctuation *int     `json:"fluctuation"`
+	Fluctuation *float64 `json:"fluctuation"`
 	Debounce    *string  `json:"debounce"`
 	Purpose     *string  `json:"purpose"`
 	Tag         *string  `json:"tag"`
@@ -99,9 +101,20 @@ type rulePatch struct {
 var debouncePattern = regexp.MustCompile(`^([0-9]+(?:\.[0-9]+)?)([mhdMHD])$`)
 
 func main() {
+	onlyMigrate := flag.Bool("migrate-only", false, "只创建/升级 MySQL 表，不启动 API")
+	envFile := flag.String("env-file", "", "读取 KEY=value 配置文件（环境变量优先）")
+	flag.Parse()
+	if *envFile != "" {
+		if err := loadEnvFile(*envFile); err != nil {
+			log.Fatal(err)
+		}
+	}
 	port := env("PORT", "8901")
-	dbPath := env("DB_PATH", "monitoring.db")
-	db, err := openDatabase(dbPath)
+	dsn, err := mysqlDSN()
+	if err != nil {
+		log.Fatal(err)
+	}
+	db, err := openDatabase(dsn)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -109,8 +122,12 @@ func main() {
 	if err := migrate(db); err != nil {
 		log.Fatal(err)
 	}
+	if *onlyMigrate {
+		log.Println("MySQL 表结构已就绪，原业务数据保持不变")
+		return
+	}
 	adminUser := env("ADMIN_USERNAME", "admin")
-	adminPass := env("ADMIN_PASSWORD", "Admin@123456")
+	adminPass := os.Getenv("ADMIN_PASSWORD")
 	if err := seed(db, adminUser, adminPass); err != nil {
 		log.Fatal(err)
 	}
@@ -143,19 +160,6 @@ func env(key, fallback string) string {
 	return fallback
 }
 
-func openDatabase(path string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite", path+"?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)")
-	if err != nil {
-		return nil, err
-	}
-	db.SetMaxOpenConns(1)
-	if err := db.Ping(); err != nil {
-		_ = db.Close()
-		return nil, err
-	}
-	return db, nil
-}
-
 func newHandler(s *server, origins []string) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/health", s.health)
@@ -177,90 +181,6 @@ func newHandler(s *server, origins []string) http.Handler {
 	return accessLog(cors(origins, mux))
 }
 
-func migrate(db *sql.DB) error {
-	_, err := db.Exec(`
-CREATE TABLE IF NOT EXISTS users (
- id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE,
- password_hash TEXT NOT NULL, display_name TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE TABLE IF NOT EXISTS businesses (
- id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
- tag TEXT NOT NULL DEFAULT '', description TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1,
- tone TEXT NOT NULL DEFAULT 'green', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE TABLE IF NOT EXISTS rules (
- code TEXT PRIMARY KEY, business_id INTEGER NOT NULL, provider TEXT NOT NULL, account TEXT NOT NULL,
- threshold REAL NOT NULL DEFAULT 0, fluctuation INTEGER NOT NULL DEFAULT 0, debounce TEXT NOT NULL,
- purpose TEXT NOT NULL, tag TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1,
- created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
- FOREIGN KEY (business_id) REFERENCES businesses(id) ON UPDATE CASCADE ON DELETE CASCADE
-);
-CREATE TABLE IF NOT EXISTS alert_records (
- id INTEGER PRIMARY KEY AUTOINCREMENT, rule_code TEXT NOT NULL, business TEXT NOT NULL,
- provider TEXT NOT NULL, account TEXT NOT NULL, alert_type TEXT NOT NULL, value TEXT NOT NULL,
- detail TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT '待处理', level TEXT NOT NULL DEFAULT 'warning',
- occurred_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
- FOREIGN KEY (rule_code) REFERENCES rules(code) ON UPDATE CASCADE ON DELETE CASCADE
-);
-CREATE INDEX IF NOT EXISTS idx_rules_business ON rules(business_id);
-CREATE INDEX IF NOT EXISTS idx_records_occurred ON alert_records(occurred_at DESC);
-`)
-	return err
-}
-
-func seed(db *sql.DB, username, password string) error {
-	hash, err := hashPassword(password)
-	if err != nil {
-		return err
-	}
-	if _, err = db.Exec(`INSERT INTO users(username,password_hash,display_name) VALUES(?,?,?) ON CONFLICT(username) DO NOTHING`, username, hash, "运维中心主控"); err != nil {
-		return err
-	}
-	var count int
-	if err = db.QueryRow(`SELECT COUNT(*) FROM businesses`).Scan(&count); err != nil || count > 0 {
-		return err
-	}
-	tx, err := db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	items := [][]any{
-		{"534784", "短信商", "SMS-GATEWAY", "短信计费与余额监控", 1, "green"},
-		{"882190", "支付网关", "CORE-FIN", "支付通道监控", 1, "orange"},
-		{"319024", "物流推送", "EXPRESS", "物流通知服务", 0, "gray"},
-		{"671042", "邮件服务", "SMTP-RELAY", "邮件发送服务", 1, "green"},
-		{"920411", "身份认证通道", "OAUTH-IAM", "身份认证服务", 1, "orange"},
-	}
-	for _, item := range items {
-		if _, err = tx.Exec(`INSERT INTO businesses(code,name,tag,description,enabled,tone) VALUES(?,?,?,?,?,?)`, item...); err != nil {
-			return err
-		}
-	}
-	rules := [][]any{
-		{"664851", "534784", "阿里云", "123alibab", 1000, 50, "1d", "银行卡", "关联业务为B", 1},
-		{"379465", "534784", "华为云", "333alibab", 1000, 40, "1h", "备用专线", "暂停充值", 1},
-		{"725076", "534784", "阿里云", "222alibab", 1000, 20, "10m", "高敏通道", "暂停充值-用完截至", 1},
-		{"164534", "534784", "阿里云", "443alibab", 1000, 10, "1d", "兜底通道", "暂停充值-用完截至", 1},
-	}
-	for _, item := range rules {
-		_, err = tx.Exec(`INSERT INTO rules(code,business_id,provider,account,threshold,fluctuation,debounce,purpose,tag,enabled) SELECT ?,id,?,?,?,?,?,?,?,? FROM businesses WHERE code=?`, item[0], item[2], item[3], item[4], item[5], item[6], item[7], item[8], item[9], item[1])
-		if err != nil {
-			return err
-		}
-	}
-	records := [][]any{
-		{"664851", "短信商", "阿里云", "123alibab", "余额低于阈值", "当前余额: ¥84.20", "可用额度不足最低配置预警线(¥500.00)，预计15分钟内短信分发将阻断", "待处理", "warning", "2024-05-18 13:00:24"},
-		{"664851", "短信商", "阿里云", "222alibab", "浮动百分比超出预设", "瞬时消耗环比 +340%", "5分钟内验证码发送激增，单IP突发速率偏离常规业务基线", "处理中", "processing", "2024-05-18 13:00:10"},
-	}
-	for _, item := range records {
-		if _, err = tx.Exec(`INSERT INTO alert_records(rule_code,business,provider,account,alert_type,value,detail,status,level,occurred_at) VALUES(?,?,?,?,?,?,?,?,?,?)`, item...); err != nil {
-			return err
-		}
-	}
-	return tx.Commit()
-}
-
 func (s *server) health(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		methodNotAllowed(w)
@@ -270,7 +190,7 @@ func (s *server) health(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "数据库不可用")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "time": time.Now()})
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "database": "mysql", "time": time.Now()})
 }
 
 func (s *server) login(w http.ResponseWriter, r *http.Request) {
@@ -287,10 +207,21 @@ func (s *server) login(w http.ResponseWriter, r *http.Request) {
 	}
 	var id int64
 	var hash, displayName string
-	err := s.db.QueryRow(`SELECT id,password_hash,display_name FROM users WHERE username=?`, strings.TrimSpace(in.Username)).Scan(&id, &hash, &displayName)
+	err := s.db.QueryRow(`SELECT 0,password_hash,display_name FROM user_account WHERE account=?`, strings.TrimSpace(in.Username)).Scan(&id, &hash, &displayName)
 	if err != nil || !verifyPassword(hash, in.Password) {
 		writeError(w, http.StatusUnauthorized, "账号或密码错误")
 		return
+	}
+	if len(hash) == 64 {
+		upgraded, hashErr := hashPassword(in.Password)
+		if hashErr != nil {
+			writeError(w, 500, "密码升级失败")
+			return
+		}
+		if _, err := s.db.Exec("UPDATE user_account SET password_hash=? WHERE account=? AND password_hash=?", upgraded, strings.TrimSpace(in.Username), hash); err != nil {
+			writeError(w, 500, "密码升级失败")
+			return
+		}
 	}
 	token, err := s.issueToken(id, strings.TrimSpace(in.Username))
 	if err != nil {
@@ -310,7 +241,7 @@ func (s *server) me(w http.ResponseWriter, r *http.Request) {
 	}
 	claims, _ := verifyToken(s.secret, strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
 	var name string
-	if err := s.db.QueryRow(`SELECT display_name FROM users WHERE id=?`, claims.UserID).Scan(&name); err != nil {
+	if err := s.db.QueryRow(`SELECT display_name FROM user_account WHERE account=?`, claims.Username).Scan(&name); err != nil {
 		writeError(w, http.StatusUnauthorized, "用户不存在")
 		return
 	}
@@ -327,13 +258,13 @@ func (s *server) stats(w http.ResponseWriter, r *http.Request) {
 		dst   *int
 		query string
 	}{
-		{&businesses, `SELECT COUNT(*) FROM businesses`},
-		{&enabledBusinesses, `SELECT COUNT(*) FROM businesses WHERE enabled=1`},
-		{&rules, `SELECT COUNT(*) FROM rules`},
-		{&enabledRules, `SELECT COUNT(*) FROM rules WHERE enabled=1`},
-		{&records, `SELECT COUNT(*) FROM alert_records`},
-		{&todayAlerts, `SELECT COUNT(*) FROM alert_records WHERE date(occurred_at)=date('now','localtime')`},
-		{&pendingAlerts, `SELECT COUNT(*) FROM alert_records WHERE status='待处理'`},
+		{&businesses, `SELECT COUNT(*) FROM business`},
+		{&enabledBusinesses, `SELECT COUNT(*) FROM business WHERE notify_enabled=1`},
+		{&rules, `SELECT COUNT(*) FROM business_detail`},
+		{&enabledRules, `SELECT COUNT(*) FROM business_detail WHERE notify_enabled=1`},
+		{&records, `SELECT COUNT(*) FROM notification_log`},
+		{&todayAlerts, `SELECT COUNT(*) FROM notification_log WHERE date(alert_time)=CURRENT_DATE()`},
+		{&pendingAlerts, `SELECT COUNT(*) FROM notification_log WHERE status='待处理'`},
 	}
 	for _, query := range queries {
 		if err := s.db.QueryRow(query.query).Scan(query.dst); err != nil {
@@ -353,13 +284,13 @@ func (s *server) businesses(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		q := "%" + strings.TrimSpace(r.URL.Query().Get("q")) + "%"
 		status := r.URL.Query().Get("status")
-		where := ` WHERE (b.code LIKE ? OR b.name LIKE ? OR b.tag LIKE ?)`
+		where := ` WHERE (b.business_code LIKE ? OR b.business_name LIKE ? OR b.tag LIKE ?)`
 		args := []any{q, q, q}
 		if status == "enabled" || status == "disabled" {
-			where += ` AND b.enabled=?`
+			where += ` AND b.notify_enabled=?`
 			args = append(args, status == "enabled")
 		}
-		rows, err := s.db.Query(`SELECT b.id,b.code,b.name,b.tag,b.description,b.enabled,b.tone,strftime('%Y-%m-%d %H:%M',b.created_at),COUNT(r.code) FROM businesses b LEFT JOIN rules r ON r.business_id=b.id`+where+` GROUP BY b.id ORDER BY b.id`, args...)
+		rows, err := s.db.Query(`SELECT b.id,b.business_code,b.business_name,b.tag,COALESCE(b.description,''),b.notify_enabled,b.tone,DATE_FORMAT(b.created_at,'%Y-%m-%d %H:%i'),COUNT(r.detail_code) FROM business b LEFT JOIN business_detail r ON r.business_code=b.business_code`+where+` GROUP BY b.id ORDER BY b.id`, args...)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
@@ -390,7 +321,7 @@ func (s *server) businesses(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		result, err := s.db.Exec(`INSERT INTO businesses(code,name,tag,description,enabled,tone) VALUES(?,?,?,?,?,?)`, in.Code, in.Name, in.Tag, in.Description, in.Enabled, in.Tone)
+		result, err := s.db.Exec(`INSERT INTO business(business_code,business_name,tag,description,notify_enabled,tone) VALUES(?,?,?,?,?,?)`, in.Code, in.Name, in.Tag, in.Description, in.Enabled, in.Tone)
 		if constraint(w, err) {
 			return
 		}
@@ -441,7 +372,7 @@ func (s *server) businessByID(w http.ResponseWriter, r *http.Request) {
 			s.getBusiness(w, id)
 		}
 	case http.MethodDelete:
-		result, err := s.db.Exec(`DELETE FROM businesses WHERE id=?`, id)
+		result, err := s.db.Exec(`DELETE FROM business WHERE id=?`, id)
 		if constraint(w, err) {
 			return
 		}
@@ -458,7 +389,7 @@ func (s *server) businessByID(w http.ResponseWriter, r *http.Request) {
 func (s *server) findBusiness(id int64) (business, error) {
 	var item business
 	var enabled int
-	err := s.db.QueryRow(`SELECT b.id,b.code,b.name,b.tag,b.description,b.enabled,b.tone,strftime('%Y-%m-%d %H:%M',b.created_at),COUNT(r.code) FROM businesses b LEFT JOIN rules r ON r.business_id=b.id WHERE b.id=? GROUP BY b.id`, id).Scan(&item.ID, &item.Code, &item.Name, &item.Tag, &item.Description, &enabled, &item.Tone, &item.Time, &item.Rules)
+	err := s.db.QueryRow(`SELECT b.id,b.business_code,b.business_name,b.tag,COALESCE(b.description,''),b.notify_enabled,b.tone,DATE_FORMAT(b.created_at,'%Y-%m-%d %H:%i'),COUNT(r.detail_code) FROM business b LEFT JOIN business_detail r ON r.business_code=b.business_code WHERE b.id=? GROUP BY b.id`, id).Scan(&item.ID, &item.Code, &item.Name, &item.Tag, &item.Description, &enabled, &item.Tone, &item.Time, &item.Rules)
 	item.Enabled = enabled == 1
 	return item, err
 }
@@ -473,7 +404,12 @@ func (s *server) getBusiness(w http.ResponseWriter, id int64) {
 }
 
 func (s *server) updateBusiness(w http.ResponseWriter, id int64, in business) bool {
-	result, err := s.db.Exec(`UPDATE businesses SET code=?,name=?,tag=?,description=?,enabled=?,tone=? WHERE id=?`, in.Code, in.Name, in.Tag, in.Description, in.Enabled, in.Tone, id)
+	tx, err := s.db.Begin()
+	if constraint(w, err) {
+		return false
+	}
+	defer tx.Rollback()
+	result, err := tx.Exec(`UPDATE business SET business_code=?,business_name=?,tag=?,description=?,notify_enabled=?,tone=? WHERE id=?`, in.Code, in.Name, in.Tag, in.Description, in.Enabled, in.Tone, id)
 	if constraint(w, err) {
 		return false
 	}
@@ -481,28 +417,32 @@ func (s *server) updateBusiness(w http.ResponseWriter, id int64, in business) bo
 		writeError(w, http.StatusNotFound, "业务不存在")
 		return false
 	}
-	return true
+	_, err = tx.Exec(`UPDATE business_detail SET business_name=? WHERE business_code=?`, in.Name, in.Code)
+	if constraint(w, err) {
+		return false
+	}
+	return !constraint(w, tx.Commit())
 }
 
 func (s *server) rules(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		q := "%" + strings.TrimSpace(r.URL.Query().Get("q")) + "%"
-		where := ` WHERE (r.code LIKE ? OR b.name LIKE ? OR r.provider LIKE ? OR r.account LIKE ? OR r.purpose LIKE ?)`
+		where := ` WHERE (r.detail_code LIKE ? OR b.business_name LIKE ? OR r.vendor LIKE ? OR r.account LIKE ? OR COALESCE(r.business_purpose,'') LIKE ?)`
 		args := []any{q, q, q, q, q}
 		if value := strings.TrimSpace(r.URL.Query().Get("business")); value != "" {
-			where += ` AND (b.code=? OR b.name=?)`
+			where += ` AND (b.business_code=? OR b.business_name=?)`
 			args = append(args, value, value)
 		}
 		if value := strings.TrimSpace(r.URL.Query().Get("provider")); value != "" {
-			where += ` AND r.provider=?`
+			where += ` AND r.vendor=?`
 			args = append(args, value)
 		}
 		if status := r.URL.Query().Get("status"); status == "enabled" || status == "disabled" {
-			where += ` AND r.enabled=?`
+			where += ` AND r.notify_enabled=?`
 			args = append(args, status == "enabled")
 		}
-		rows, err := s.db.Query(`SELECT r.code,b.code,b.name,r.provider,r.account,r.threshold,r.fluctuation,r.debounce,r.purpose,r.tag,r.enabled FROM rules r JOIN businesses b ON b.id=r.business_id`+where+` ORDER BY r.created_at,r.code`, args...)
+		rows, err := s.db.Query(`SELECT r.detail_code,b.business_code,b.business_name,r.vendor,r.account,r.balance_threshold,r.fluctuation_percent,r.alert_silence_seconds,COALESCE(r.business_purpose,''),COALESCE(r.tag,''),r.notify_enabled FROM business_detail r JOIN business b ON b.business_code=r.business_code`+where+` ORDER BY r.created_at,r.detail_code`, args...)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
@@ -517,6 +457,7 @@ func (s *server) rules(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			item.Enabled = enabled == 1
+			item.Debounce = displayDebounce(item.Debounce)
 			out = append(out, item)
 		}
 		if err := rows.Err(); err != nil {
@@ -533,7 +474,7 @@ func (s *server) rules(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		result, err := s.db.Exec(`INSERT INTO rules(code,business_id,provider,account,threshold,fluctuation,debounce,purpose,tag,enabled) SELECT ?,id,?,?,?,?,?,?,?,? FROM businesses WHERE code=?`, in.Code, in.Provider, in.Account, in.Threshold, in.Fluctuation, in.Debounce, in.Purpose, in.Tag, in.Enabled, in.Parent)
+		result, err := s.db.Exec(`INSERT INTO business_detail(detail_code,business_code,business_name,vendor,account,balance_threshold,fluctuation_percent,alert_silence_seconds,business_purpose,tag,notify_enabled) SELECT ?,business_code,business_name,?,?,?,?,?,?,?,? FROM business WHERE business_code=?`, in.Code, in.Provider, in.Account, in.Threshold, in.Fluctuation, debounceSeconds(in.Debounce), in.Purpose, in.Tag, in.Enabled, in.Parent)
 		if constraint(w, err) {
 			return
 		}
@@ -590,7 +531,7 @@ func (s *server) ruleByCode(w http.ResponseWriter, r *http.Request) {
 			s.getRule(w, current.Code)
 		}
 	case http.MethodDelete:
-		result, err := s.db.Exec(`DELETE FROM rules WHERE code=?`, code)
+		result, err := s.db.Exec(`DELETE FROM business_detail WHERE detail_code=?`, code)
 		if constraint(w, err) {
 			return
 		}
@@ -607,8 +548,9 @@ func (s *server) ruleByCode(w http.ResponseWriter, r *http.Request) {
 func (s *server) findRule(code string) (rule, error) {
 	var item rule
 	var enabled int
-	err := s.db.QueryRow(`SELECT r.code,b.code,b.name,r.provider,r.account,r.threshold,r.fluctuation,r.debounce,r.purpose,r.tag,r.enabled FROM rules r JOIN businesses b ON b.id=r.business_id WHERE r.code=?`, code).Scan(&item.Code, &item.Parent, &item.Business, &item.Provider, &item.Account, &item.Threshold, &item.Fluctuation, &item.Debounce, &item.Purpose, &item.Tag, &enabled)
+	err := s.db.QueryRow(`SELECT r.detail_code,b.business_code,b.business_name,r.vendor,r.account,r.balance_threshold,r.fluctuation_percent,r.alert_silence_seconds,COALESCE(r.business_purpose,''),COALESCE(r.tag,''),r.notify_enabled FROM business_detail r JOIN business b ON b.business_code=r.business_code WHERE r.detail_code=?`, code).Scan(&item.Code, &item.Parent, &item.Business, &item.Provider, &item.Account, &item.Threshold, &item.Fluctuation, &item.Debounce, &item.Purpose, &item.Tag, &enabled)
 	item.Enabled = enabled == 1
+	item.Debounce = displayDebounce(item.Debounce)
 	return item, err
 }
 
@@ -622,7 +564,7 @@ func (s *server) getRule(w http.ResponseWriter, code string) {
 }
 
 func (s *server) updateRule(w http.ResponseWriter, oldCode string, in rule) bool {
-	result, err := s.db.Exec(`UPDATE rules SET code=?,business_id=(SELECT id FROM businesses WHERE code=?),provider=?,account=?,threshold=?,fluctuation=?,debounce=?,purpose=?,tag=?,enabled=? WHERE code=?`, in.Code, in.Parent, in.Provider, in.Account, in.Threshold, in.Fluctuation, in.Debounce, in.Purpose, in.Tag, in.Enabled, oldCode)
+	result, err := s.db.Exec(`UPDATE business_detail r JOIN business b ON b.business_code=? SET r.detail_code=?,r.business_code=b.business_code,r.business_name=b.business_name,r.vendor=?,r.account=?,r.balance_threshold=?,r.fluctuation_percent=?,r.alert_silence_seconds=?,r.business_purpose=?,r.tag=?,r.notify_enabled=? WHERE r.detail_code=?`, in.Parent, in.Code, in.Provider, in.Account, in.Threshold, in.Fluctuation, debounceSeconds(in.Debounce), in.Purpose, in.Tag, in.Enabled, oldCode)
 	if constraint(w, err) {
 		return false
 	}
@@ -637,7 +579,7 @@ func (s *server) records(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		q := "%" + strings.TrimSpace(r.URL.Query().Get("q")) + "%"
-		rows, err := s.db.Query(`SELECT id,strftime('%H:%M:%S',occurred_at),strftime('%Y-%m-%d',occurred_at),rule_code,business,provider,account,alert_type,value,detail,status,level FROM alert_records WHERE rule_code LIKE ? OR business LIKE ? OR provider LIKE ? OR account LIKE ? OR alert_type LIKE ? ORDER BY occurred_at DESC,id DESC`, q, q, q, q, q)
+		rows, err := s.db.Query(`SELECT id,DATE_FORMAT(alert_time,'%H:%i:%s'),DATE_FORMAT(alert_time,'%Y-%m-%d'),detail_code,business_name,vendor,account,COALESCE(NULLIF(alert_type,''),alert_content),alert_value,alert_content,status,level FROM notification_log WHERE detail_code LIKE ? OR business_name LIKE ? OR vendor LIKE ? OR account LIKE ? OR alert_type LIKE ? ORDER BY alert_time DESC,id DESC`, q, q, q, q, q)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
@@ -666,7 +608,7 @@ func (s *server) records(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		occurredAt := time.Now().Format("2006-01-02 15:04:05")
+		occurredAt := ""
 		if in.Date != "" {
 			if _, err := time.ParseInLocation("2006-01-02 15:04:05", in.Date+" "+in.Time, time.Local); err != nil {
 				writeError(w, http.StatusBadRequest, "告警日期时间格式无效")
@@ -674,7 +616,7 @@ func (s *server) records(w http.ResponseWriter, r *http.Request) {
 			}
 			occurredAt = in.Date + " " + in.Time
 		}
-		result, err := s.db.Exec(`INSERT INTO alert_records(rule_code,business,provider,account,alert_type,value,detail,status,level,occurred_at) VALUES(?,?,?,?,?,?,?,?,?,?)`, in.Code, in.Business, in.Provider, in.Account, in.Type, in.Value, in.Detail, in.Status, in.Level, occurredAt)
+		result, err := s.db.Exec(`INSERT INTO notification_log(detail_code,business_name,vendor,account,alert_type,alert_value,alert_content,status,level,alert_time,event_id) VALUES(?,?,?,?,?,?,?,?,?,COALESCE(NULLIF(?,''),CURRENT_TIMESTAMP),NULLIF(?,'')) ON DUPLICATE KEY UPDATE id=LAST_INSERT_ID(id)`, in.Code, in.Business, in.Provider, in.Account, in.Type, in.Value, in.Detail, in.Status, in.Level, occurredAt, in.EventID)
 		if constraint(w, err) {
 			return
 		}
@@ -705,7 +647,7 @@ func (s *server) recordByID(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "无效的告警状态")
 			return
 		}
-		result, err := s.db.Exec(`UPDATE alert_records SET status=?,level=? WHERE id=?`, in.Status, level, id)
+		result, err := s.db.Exec(`UPDATE notification_log SET status=?,level=? WHERE id=?`, in.Status, level, id)
 		if constraint(w, err) {
 			return
 		}
@@ -715,7 +657,7 @@ func (s *server) recordByID(w http.ResponseWriter, r *http.Request) {
 		}
 		s.getRecord(w, id)
 	case http.MethodDelete:
-		result, err := s.db.Exec(`DELETE FROM alert_records WHERE id=?`, id)
+		result, err := s.db.Exec(`DELETE FROM notification_log WHERE id=?`, id)
 		if constraint(w, err) {
 			return
 		}
@@ -731,7 +673,7 @@ func (s *server) recordByID(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) getRecord(w http.ResponseWriter, id int64) {
 	var item record
-	err := s.db.QueryRow(`SELECT id,strftime('%H:%M:%S',occurred_at),strftime('%Y-%m-%d',occurred_at),rule_code,business,provider,account,alert_type,value,detail,status,level FROM alert_records WHERE id=?`, id).Scan(&item.ID, &item.Time, &item.Date, &item.Code, &item.Business, &item.Provider, &item.Account, &item.Type, &item.Value, &item.Detail, &item.Status, &item.Level)
+	err := s.db.QueryRow(`SELECT id,DATE_FORMAT(alert_time,'%H:%i:%s'),DATE_FORMAT(alert_time,'%Y-%m-%d'),detail_code,business_name,vendor,account,COALESCE(NULLIF(alert_type,''),alert_content),alert_value,alert_content,status,level FROM notification_log WHERE id=?`, id).Scan(&item.ID, &item.Time, &item.Date, &item.Code, &item.Business, &item.Provider, &item.Account, &item.Type, &item.Value, &item.Detail, &item.Status, &item.Level)
 	if err != nil {
 		s.writeLookupError(w, err, "告警记录不存在")
 		return
@@ -781,13 +723,20 @@ func normalizeDebounce(value string) (string, error) {
 		return "", errors.New("防抖告警跨度格式必须为正数加 m、h 或 d，例如 10m、2h、1d")
 	}
 	amount, err := strconv.ParseFloat(matches[1], 64)
-	if err != nil || amount <= 0 || math.IsNaN(amount) || math.IsInf(amount, 0) {
-		return "", errors.New("防抖告警跨度必须大于 0")
+	if err != nil || amount < 0 || math.IsNaN(amount) || math.IsInf(amount, 0) {
+		return "", errors.New("防抖告警跨度不能小于 0")
+	}
+	seconds := amount * map[string]float64{"m": 60, "h": 3600, "d": 86400}[strings.ToLower(matches[2])]
+	if seconds > 315360000 || math.Abs(seconds-math.Round(seconds)) > 0.000001 {
+		return "", errors.New("防抖跨度需为整数秒，且不超过十年")
 	}
 	return strconv.FormatFloat(amount, 'f', -1, 64) + strings.ToLower(matches[2]), nil
 }
 
 func (s *server) normalizeRecord(item *record) error {
+	if item.EventID != "" && !regexp.MustCompile(`^[a-f0-9]{32}$`).MatchString(item.EventID) {
+		return errors.New("eventId 必须为 32 位小写十六进制事件标识")
+	}
 	item.Code = strings.TrimSpace(item.Code)
 	item.Business = strings.TrimSpace(item.Business)
 	item.Provider = strings.TrimSpace(item.Provider)
@@ -802,7 +751,7 @@ func (s *server) normalizeRecord(item *record) error {
 		return errors.New("规则编码和告警类型不能为空")
 	}
 	var businessName, provider, account string
-	err := s.db.QueryRow(`SELECT b.name,r.provider,r.account FROM rules r JOIN businesses b ON b.id=r.business_id WHERE r.code=?`, item.Code).Scan(&businessName, &provider, &account)
+	err := s.db.QueryRow(`SELECT b.business_name,r.vendor,r.account FROM business_detail r JOIN business b ON b.business_code=r.business_code WHERE r.detail_code=?`, item.Code).Scan(&businessName, &provider, &account)
 	if errors.Is(err, sql.ErrNoRows) {
 		return errors.New("关联的告警规则不存在")
 	}
@@ -947,12 +896,17 @@ func hashPassword(password string) (string, error) {
 }
 
 func verifyPassword(encoded, password string) bool {
+	if len(encoded) == 64 {
+		want, err := hex.DecodeString(encoded)
+		sum := sha256.Sum256([]byte(password))
+		return err == nil && hmac.Equal(want, sum[:])
+	}
 	parts := strings.Split(encoded, "$")
 	if len(parts) != 4 || parts[0] != "pbkdf2-sha256" {
 		return false
 	}
 	iterations, err := strconv.Atoi(parts[1])
-	if err != nil {
+	if err != nil || iterations < 1 || iterations > 2000000 {
 		return false
 	}
 	salt, err := hex.DecodeString(parts[2])
@@ -1019,7 +973,8 @@ func constraint(w http.ResponseWriter, err error) bool {
 	if err == nil {
 		return false
 	}
-	if strings.Contains(strings.ToLower(err.Error()), "constraint") {
+	var mysqlErr *mysql.MySQLError
+	if errors.As(err, &mysqlErr) && (mysqlErr.Number == 1062 || mysqlErr.Number == 1451 || mysqlErr.Number == 1452 || mysqlErr.Number == 3819) {
 		writeError(w, http.StatusConflict, "数据冲突：编码可能已存在，或关联数据不存在")
 	} else {
 		writeError(w, http.StatusInternalServerError, err.Error())

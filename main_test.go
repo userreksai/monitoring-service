@@ -4,15 +4,17 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
-	_ "modernc.org/sqlite"
+	"github.com/go-sql-driver/mysql"
 )
 
 type apiFixture struct {
@@ -22,17 +24,19 @@ type apiFixture struct {
 
 func newAPIFixture(t *testing.T) apiFixture {
 	t.Helper()
-	dbPath := filepath.ToSlash(filepath.Join(t.TempDir(), "monitoring-test.db"))
-	db, err := sql.Open("sqlite", dbPath+"?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)")
-	if err != nil {
-		t.Fatal(err)
-	}
-	db.SetMaxOpenConns(1)
-	t.Cleanup(func() { _ = db.Close() })
+	db := newTestDatabase(t)
 	if err := migrate(db); err != nil {
 		t.Fatal(err)
 	}
 	if err := seed(db, "admin", "test-password"); err != nil {
+		t.Fatal(err)
+	}
+	_, err := db.Exec(`INSERT INTO business(business_code,business_name) VALUES('534784','短信商')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`INSERT INTO business_detail(detail_code,business_code,business_name,fluctuation_percent,balance_threshold,vendor,account,alert_silence_seconds) VALUES('664851','534784','短信商',50,1000,'阿里云','123alibab',86400)`)
+	if err != nil {
 		t.Fatal(err)
 	}
 	httpServer := httptest.NewServer(newHandler(
@@ -57,6 +61,37 @@ func newAPIFixture(t *testing.T) apiFixture {
 	}
 	fixture.token = login.Token
 	return fixture
+}
+
+// Tests create/drop only a unique monitoring_test_* database, never a supplied production DB.
+func newTestDatabase(t *testing.T) *sql.DB {
+	t.Helper()
+	dsn := os.Getenv("MYSQL_TEST_DSN")
+	if dsn == "" {
+		t.Skip("MYSQL_TEST_DSN 未配置：跳过真实 MySQL 集成测试")
+	}
+	config, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.DBName = ""
+	admin, err := openDatabase(config.FormatDSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := fmt.Sprintf("monitoring_test_%d", time.Now().UnixNano())
+	if _, err = admin.Exec("CREATE DATABASE `" + name + "` CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci"); err != nil {
+		admin.Close()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { admin.Exec("DROP DATABASE `" + name + "`"); admin.Close() })
+	config.DBName = name
+	db, err := openDatabase(config.FormatDSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return db
 }
 
 func (f apiFixture) request(t *testing.T, method, path string, payload any, authenticated bool) (int, []byte) {
