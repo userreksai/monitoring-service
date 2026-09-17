@@ -1,15 +1,45 @@
 #!/usr/bin/env bash
-# 从本次交付的源码构建并安装，避免拉取尚未更新的远端旧 SQLite 版本。
+# 仓库内执行时使用当前源码；下载到 /tmp 后执行时获取部署仓库源码。
 # 不自动重启：完成数据库预览/迁移之后再切换两个服务。
 set -euo pipefail
-[[ "$(id -u)" == 0 ]] || { echo '请使用 sudo 或 root 执行'; exit 1; }
+[[ "${CHECK_SOURCE_ONLY:-0}" == 1 || "$(id -u)" == 0 ]] || { echo '请使用 sudo 或 root 执行'; exit 1; }
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source_dir="$script_dir/.."
-app_dir="${1:-/opt/monitoring-service}"
+app_dir="${1:-${APP_DIR:-/opt/monitoring-service}}"
 env_file="$app_dir/.env"
 if [[ ! "$app_dir" =~ ^/[a-zA-Z0-9_/-]+$ ]]; then
   echo '后端安装目录必须是仅含字母、数字、下划线、斜线、连字符的绝对路径。' >&2
   exit 1
+fi
+if [[ ! -f "$source_dir/go.mod" || ! -f "$source_dir/main.go" || ! -f "$source_dir/database.go" ]]; then
+  # 独立下载的脚本不能用 /tmp/.. 当作 Go 项目目录。
+  source_dir="$app_dir"
+  repo_url="${REPO_URL:-https://github.com/userreksai/monitoring-service.git}"
+  branch="${BRANCH:-main}"
+  if [[ -d "$app_dir/.git" ]]; then
+    command -v git >/dev/null || { echo '请先安装 git'; exit 1; }
+    git -c safe.directory="$app_dir" -C "$app_dir" diff --quiet
+    git -c safe.directory="$app_dir" -C "$app_dir" diff --cached --quiet
+    current_branch="$(git -c safe.directory="$app_dir" -C "$app_dir" branch --show-current)"
+    if [[ "$current_branch" != "$branch" ]]; then
+      echo "部署目录当前分支为 $current_branch，请先切换到 $branch，或设置 BRANCH。" >&2
+      exit 1
+    fi
+    git -c safe.directory="$app_dir" -C "$app_dir" fetch "$repo_url" "$branch"
+    git -c safe.directory="$app_dir" -C "$app_dir" merge --ff-only FETCH_HEAD
+  elif [[ ! -f "$app_dir/go.mod" ]]; then
+    command -v git >/dev/null || { echo '请先安装 git'; exit 1; }
+    # git clone 对非空目录会拒绝，不覆盖已有配置或文件。
+    git clone --branch "$branch" --single-branch "$repo_url" "$app_dir"
+  fi
+fi
+for required_file in go.mod main.go database.go .env.example; do
+  [[ -f "$source_dir/$required_file" ]] || { echo "源码目录 $source_dir 缺少 $required_file，请使用 MySQL 版完整后端源码。" >&2; exit 1; }
+done
+source_dir="$(cd -- "$source_dir" && pwd)"
+echo "后端源码目录：$source_dir"
+if [[ "${CHECK_SOURCE_ONLY:-0}" == 1 ]]; then
+  exit 0
 fi
 if [[ ! -f "$env_file" ]]; then
   mkdir -p "$app_dir"

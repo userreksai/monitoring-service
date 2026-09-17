@@ -17,6 +17,15 @@ go build -o bin/monitoring-service .
 
 配置：`MYSQL_HOST`、`MYSQL_PORT`、`MYSQL_DATABASE`、`MYSQL_USER`、`MYSQL_PASSWORD`、`MYSQL_TIME_ZONE`、`MYSQL_TLS`；其他配置为 `PORT`、`JWT_SECRET`、`CORS_ORIGINS`、`ADMIN_USERNAME`、`ADMIN_PASSWORD`。已有环境变量优先于 `--env-file`。新管理员仅在该账号不存在时创建，已有密码不会被初始化参数覆盖；旧 SHA-256 密码登录成功后升级为 PBKDF2。
 
+支持下载脚本到 `/tmp` 后安装，脚本会在 `/opt/monitoring-service` 克隆或快进更新源码，再进入有 `go.mod` 的实际目录构建：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/userreksai/monitoring-service/main/deploy/install.sh -o /tmp/install-monitoring-service.sh
+sudo bash /tmp/install-monitoring-service.sh
+```
+
+在仓库内执行时直接使用当前源码，不拉取远端。独立下载执行时可设置 `REPO_URL`、`BRANCH`、`APP_DIR`。已有仓库有未提交修改、分支不一致或无法快进时停止，不覆盖现有配置。`CHECK_SOURCE_ONLY=1 bash deploy/install.sh` 仅定位/获取并验证源码，不创建配置、不构建、不操作服务，可用于排查目录问题。
+
 启动迁移只增加缺失字段和表，不插入示例业务，不覆盖已有账号/阈值。`schema.sql` 定义完整新库结构，`database.go` 补齐原表字段。MySQL 账号需要本库 SELECT、INSERT、UPDATE、DELETE、CREATE、ALTER、INDEX、REFERENCES 权限。
 
 ## 生产升级

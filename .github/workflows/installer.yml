@@ -1,0 +1,20 @@
+name: Installer source path checks
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - deploy/install.sh
+      - test_install_script.py
+      - .github/workflows/installer.yml
+permissions:
+  contents: read
+jobs:
+  installer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check shell syntax and source selection
+        run: |
+          bash -n deploy/install.sh
+          python3 -m unittest -v test_install_script.py
